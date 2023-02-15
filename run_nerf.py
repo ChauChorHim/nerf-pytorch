@@ -51,6 +51,17 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     return outputs
 
 
+def run_offset_model(inputs, viewdirs, fn, netchunk=1024*64):
+    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
+    if viewdirs is not None:
+            input_dirs = viewdirs[:,None].expand(inputs.shape)
+            input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+            inputs_flat = torch.cat([inputs_flat, input_dirs_flat], -1)
+
+    outputs_flat = batchify(fn, netchunk)(inputs_flat)
+    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    return outputs
+
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
@@ -128,7 +139,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
 
-    k_extract = ['rgb_map', 'disp_map', 'acc_map']
+    k_extract = ['rgb_map', 'disp_map', 'acc_map', 'delta_pts']
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
@@ -151,7 +162,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        rgb, disp, acc, _, extras = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
         if i==0:
@@ -198,10 +209,17 @@ def create_nerf(args):
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
 
+    offset_model = offset_NeRF(D=args.netdepth, W=args.netwidth,
+                               input_ch=3, output_ch=3, skips=skips,
+                               input_ch_views=3, use_viewdirs=args.use_viewdirs).to(device)
+    grad_vars += list(offset_model.parameters())
+
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
                                                                 netchunk=args.netchunk)
+    offset_model_query_fn = lambda inputs, viewdirs, network_fn: run_offset_model(inputs, viewdirs, offset_model,
+                                                                                  netchunk=args.netchunk)
 
     # Create optimizer
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
@@ -231,6 +249,7 @@ def create_nerf(args):
         model.load_state_dict(ckpt['network_fn_state_dict'])
         if model_fine is not None:
             model_fine.load_state_dict(ckpt['network_fine_state_dict'])
+        offset_model.load_state_dict(ckpt['offset_model'])
 
     ##########################
 
@@ -244,6 +263,8 @@ def create_nerf(args):
         'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
         'raw_noise_std' : args.raw_noise_std,
+        'offset_model_query_fn' : offset_model_query_fn,
+        'offset_model' : offset_model,
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -277,7 +298,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
-    dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
+    dists = dists * torch.linalg.norm(rays_d[...,None,:], dim=-1)
 
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
     noise = 0.
@@ -308,6 +329,8 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
 def render_rays(ray_batch,
                 network_fn,
                 network_query_fn,
+                offset_model,
+                offset_model_query_fn,
                 N_samples,
                 retraw=False,
                 lindisp=False,
@@ -381,8 +404,10 @@ def render_rays(ray_batch,
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
 
-#     raw = run_network(pts)
-    raw = network_query_fn(pts, viewdirs, network_fn)
+    # raw = run_network(pts)
+    delta_pts = offset_model_query_fn(pts, viewdirs, offset_model)
+    raw = network_query_fn(pts + delta_pts, viewdirs, network_fn)
+    # raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
@@ -402,7 +427,7 @@ def render_rays(ray_batch,
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
-    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
+    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'delta_pts' : delta_pts}
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
@@ -456,6 +481,8 @@ def config_parser():
                         help='do not reload weights from saved ckpt')
     parser.add_argument("--ft_path", type=str, default=None, 
                         help='specific weights npy file to reload for coarse network')
+    parser.add_argument("--reg_lambda", type=float, default=1e-5,
+                        help='lambda used in adding the regularization term in loss')
 
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64, 
@@ -757,14 +784,15 @@ def train():
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
-        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                verbose=i < 10, retraw=True,
-                                                **render_kwargs_train)
+        rgb, disp, acc, delta_pts, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                 verbose=i < 10, retraw=True,
+                                                 **render_kwargs_train)
 
         optimizer.zero_grad()
         img_loss = img2mse(rgb, target_s)
+        delta_pts_reg = torch.norm(delta_pts)   # regularization term to suppress the excessive increase of the offset
         trans = extras['raw'][...,-1]
-        loss = img_loss
+        loss = img_loss + args.reg_lambda * delta_pts_reg
         psnr = mse2psnr(img_loss)
 
         if 'rgb0' in extras:
@@ -795,6 +823,7 @@ def train():
                 'global_step': global_step,
                 'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
                 'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
+                'offset_model': render_kwargs_train['offset_model'].state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }, path)
             print('Saved checkpoints at', path)
@@ -823,7 +852,18 @@ def train():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
-
+        if i % args.i_img == 0:
+            # Log a rendered validation view to Tensorboard
+            img_i = i_test[5]  # np.random.choice(i_val)
+            target = images[img_i]
+            pose = poses[img_i, :3, :4]
+            with torch.no_grad():
+                rgb, disp, acc, _, extras = render(H, W, K, chunk=args.chunk, c2w=pose,
+                                                   **render_kwargs_test)
+            testimgdir = os.path.join(basedir, expname, 'training_nerf')
+            os.makedirs(testimgdir, exist_ok=True)
+            imageio.imwrite(os.path.join(testimgdir, 'rendered_{:06d}.png'.format(i)), to8b(rgb.cpu().numpy()))
+            imageio.imwrite(os.path.join(testimgdir, 'ref_{:06d}.png'.format(img_i)), to8b(images[img_i].cpu().numpy()))
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
